@@ -21,9 +21,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math"
+	"math/big"
+	"strconv"
+	"strings"
 )
 
 func main() {
@@ -75,6 +81,34 @@ func main() {
 // is the size of both the output (defined by the hash function) and our inputs
 type Block [32]byte
 
+// --- Methods on the Block type
+
+// ToHex returns a hex encoded string of the block data, with no newlines.
+func (self Block) ToHex() string {
+	return fmt.Sprintf("%064x", self[:])
+}
+
+// Hash returns the sha256 hash of the block.
+func (self Block) Hash() Block {
+	return sha256.Sum256(self[:])
+}
+
+// IsPreimage returns true if the block is a preimage of the argument.
+// For example, if Y = hash(X), then X.IsPreimage(Y) will return true,
+// and Y.IsPreimage(X) will return false.
+func (self Block) IsPreimage(arg Block) bool {
+	return self.Hash() == arg
+}
+
+// BlockFromByteSlice returns a block from a variable length byte slice.
+// Watch out!  Silently ignores potential errors like the slice being too
+// long or too short!
+func BlockFromByteSlice(by []byte) Block {
+	var bl Block
+	copy(bl[:], by)
+	return bl
+}
+
 type SecretKey struct {
 	ZeroPre [256]Block
 	OnePre  [256]Block
@@ -110,7 +144,7 @@ func HexToPubkey(s string) (PublicKey, error) {
 	// first, make sure hex string is of correct length
 	if len(s) != expectedLength {
 		return p, fmt.Errorf(
-			"Pubkey string %d characters, expect %d", expectedLength)
+			"Pubkey string %d characters, expect %d", expectedLength, expectedLength)
 	}
 
 	// decode from hex to a byte slice
@@ -129,37 +163,6 @@ func HexToPubkey(s string) (PublicKey, error) {
 	}
 
 	return p, nil
-}
-
-// A message to be signed is just a block.
-type Message Block
-
-// --- Methods on the Block type
-
-// ToHex returns a hex encoded string of the block data, with no newlines.
-func (self Block) ToHex() string {
-	return fmt.Sprintf("%064x", self[:])
-}
-
-// Hash returns the sha256 hash of the block.
-func (self Block) Hash() Block {
-	return sha256.Sum256(self[:])
-}
-
-// IsPreimage returns true if the block is a preimage of the argument.
-// For example, if Y = hash(X), then X.IsPreimage(Y) will return true,
-// and Y.IsPreimage(X) will return false.
-func (self Block) IsPreimage(arg Block) bool {
-	return self.Hash() == arg
-}
-
-// BlockFromByteSlice returns a block from a variable length byte slice.
-// Watch out!  Silently ignores potential errors like the slice being too
-// long or too short!
-func BlockFromByteSlice(by []byte) Block {
-	var bl Block
-	copy(bl[:], by)
-	return bl
 }
 
 // A signature consists of 32 blocks.  It's a selective reveal of the private
@@ -188,7 +191,7 @@ func HexToSignature(s string) (Signature, error) {
 	// first, make sure hex string is of correct length
 	if len(s) != expectedLength {
 		return sig, fmt.Errorf(
-			"Pubkey string %d characters, expect %d", expectedLength)
+			"Pubkey string %d characters, expect %d", expectedLength, expectedLength)
 	}
 
 	// decode from hex to a byte slice
@@ -205,9 +208,31 @@ func HexToSignature(s string) (Signature, error) {
 	return sig, nil
 }
 
+// A message to be signed is just a block.
+type Message Block
+
 // GetMessageFromString returns a Message which is the hash of the given string.
 func GetMessageFromString(s string) Message {
 	return sha256.Sum256([]byte(s))
+}
+
+func MessageToStringBitRepresentation(msg Message) string {
+	msgHash := Block(msg).Hash()
+	var bitStr string
+	for i, _ := range msgHash {
+		s := strconv.FormatInt(int64(msgHash[i]), 2)
+
+		// ensure len(bitStr) is always 256
+		if len(s) < 8 {
+			numZeros := 8 - len(s)
+			for j := 0; j < numZeros; j++ {
+				bitStr += "0"
+			}
+		}
+		bitStr += s
+	}
+	// fmt.Printf("%s is %d long\n\n", bitStr, len(bitStr))
+	return bitStr
 }
 
 // --- Functions
@@ -220,10 +245,25 @@ func GenerateKey() (SecretKey, PublicKey, error) {
 	var sec SecretKey
 	var pub PublicKey
 
-	// Your code here
-	// ===
+	// To create the private key Alice uses the random number generator to produce 256 pairs of random numbers (2×256 numbers in total), each number being 256 bits in size, that is, a total of 2×256×256 bits = 128 Kibit in total. This is her private key and she will store it away in a secure place for later use.
+	for i, _ := range sec.ZeroPre {
+		result, _ := rand.Int(rand.Reader, big.NewInt(math.MaxInt64))
+		wbuf := new(bytes.Buffer)
+		err := binary.Write(wbuf, binary.LittleEndian, result.Int64())
+		if err != nil {
+			fmt.Println("binary.Write failed:", err)
+		}
+		bits := wbuf.Bytes()
+		sec.ZeroPre[i] = BlockFromByteSlice(bits[:4])
+		sec.OnePre[i] = BlockFromByteSlice(bits[4:])
+	}
 
-	// ===
+	// To create the public key she hashes each of the 512 random numbers in the private key, thus creating 512 hashes, each 256 bits in size. (Also 128 Kbits in total.) These 512 numbers form her public key, which she will share with the world.
+	for i, _ := range sec.ZeroPre {
+		pub.ZeroHash[i] = sec.ZeroPre[i].Hash()
+		pub.OneHash[i] = sec.OnePre[i].Hash()
+	}
+
 	return sec, pub, nil
 }
 
@@ -231,10 +271,18 @@ func GenerateKey() (SecretKey, PublicKey, error) {
 func Sign(msg Message, sec SecretKey) Signature {
 	var sig Signature
 
-	// Your code here
-	// ===
+	// Later Alice wants to sign a message. First she hashes the message to a 256-bit hash sum. Then, for each bit in the hash, based on the value of the bit, she picks one number from the corresponding pairs of numbers that make up her private key (i.e., if the bit is 0, the first number is chosen, and if the bit is 1, the second is chosen). This produces a sequence of 256 numbers. As each number is itself 256 bits long the total size of her signature will be 256×256 bits = 64 KiB. These (originally randomly picked) numbers are her signature and she publishes them along with the message.
+	bitStr := MessageToStringBitRepresentation(msg)
 
-	// ===
+	// this can fail if len(bitStr) is not 256
+	for i, v := range bitStr {
+		if strings.Compare(string(v), "0") == 0 {
+			sig.Preimage[i] = sec.ZeroPre[i]
+		} else {
+			sig.Preimage[i] = sec.OnePre[i]
+		}
+	}
+
 	return sig
 }
 
@@ -242,10 +290,31 @@ func Sign(msg Message, sec SecretKey) Signature {
 // describing the validity of the signature.
 func Verify(msg Message, pub PublicKey, sig Signature) bool {
 
-	// Your code here
-	// ===
+	// Then Bob wants to verify Alice's signature of the message. He also hashes the message to get a 256-bit hash sum. Then he uses the bits in the hash sum to pick out 256 of the hashes in Alice's public key. He picks the hashes in the same manner that Alice picked the random numbers for the signature. That is, if the first bit of the message hash is a 0, he picks the first hash in the first pair, and so on.
+	verificationBlocks := [256]Block{}
 
-	// ===
+	bitStr := MessageToStringBitRepresentation(msg)
+
+	for i, v := range bitStr {
+		if strings.Compare(string(v), "0") == 0 {
+			verificationBlocks[i] = pub.ZeroHash[i]
+		} else {
+			verificationBlocks[i] = pub.OneHash[i]
+		}
+	}
+
+	// Then Bob hashes each of the 256 random numbers in Alice's signature. This gives him 256 hashes. If these 256 hashes exactly match the 256 hashes he just picked from Alice's public key then the signature is ok. If not, then the signature is wrong.
+	verificationHashes := [256]Block{}
+
+	for i, v := range sig.Preimage {
+		verificationHashes[i] = v.Hash()
+	}
+
+	for i, _ := range verificationHashes {
+		if strings.Compare(verificationBlocks[i].ToHex(), verificationHashes[i].ToHex()) != 0 {
+			return false
+		}
+	}
 
 	return true
 }
